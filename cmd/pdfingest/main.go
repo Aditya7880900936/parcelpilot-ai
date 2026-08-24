@@ -17,14 +17,14 @@ import (
 )
 
 type documentMeta struct {
-	Title          string
-	DocumentType   string
-	Status         string
-	AuthorityRank  int
-	AccountID      *string
-	EffectiveFrom  *time.Time
-	EffectiveTo    *time.Time
-	SourceUpdated  *time.Time
+	Title         string
+	DocumentType  string
+	Status        string
+	AuthorityRank int
+	AccountID     *string
+	EffectiveFrom *time.Time
+	EffectiveTo   *time.Time
+	SourceUpdated *time.Time
 }
 
 var documentMetadata = map[string]documentMeta{
