@@ -71,7 +71,7 @@ func main() {
 	// Action execution layer.
 	executor := action.NewExecutor(pool)
 
-	query := "Can Northstar cancel ORD-1001?"
+	query := "Can Northstar cancel ORD-2001?"
 
 	log.Printf("Query: %s", query)
 
@@ -79,7 +79,7 @@ func main() {
 		ctx,
 		query,
 		"ACCT-001",
-		"ORD-1001",
+		"ORD-2001",
 	)
 	if err != nil {
 		log.Fatalf("agent evaluation failed: %v", err)
@@ -91,7 +91,7 @@ func main() {
 	log.Printf("Confidence: %.4f", response.Confidence)
 	log.Printf("Escalate: %t", response.Escalate)
 
-	if response.Action != nil {
+	if response.Action != nil && !response.Escalate && response.Confidence >= 0.90 {
 		log.Printf(
 			"Action: %s → %s (%s)",
 			response.Action.Type,
@@ -99,8 +99,8 @@ func main() {
 			response.Action.Reason,
 		)
 
-		// Execute only deterministic, approved actions.
-		if response.Action.Type == "CANCEL_ORDER" && !response.Escalate {
+		// Execute deterministic actions returned by the decision engine.
+		if response.Action != nil {
 			if err := executor.Execute(ctx, response.Action); err != nil {
 				log.Fatalf("action execution failed: %v", err)
 			}

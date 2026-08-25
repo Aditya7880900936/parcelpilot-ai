@@ -66,11 +66,25 @@ func (d *DecisionEngine) Evaluate(ctx Context) Decision {
 			},
 		}
 
+	case "RETURN_TO_ORIGIN":
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason:     "order is already marked for return-to-origin",
+		}
+
 	case "DELIVERED":
 		return Decision{
 			Allowed:    false,
 			Confidence: 1.0,
 			Reason:     "delivered shipments cannot be cancelled",
+		}
+
+	case "CANCELLED":
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason:     "order is already cancelled",
 		}
 
 	case "BOOKED":
