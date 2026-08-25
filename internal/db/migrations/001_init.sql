@@ -26,7 +26,13 @@ CREATE TABLE orders (
     account_id                  TEXT NOT NULL REFERENCES accounts(account_id),
     carrier                     TEXT NOT NULL,
     status                      TEXT NOT NULL CHECK (
-        status IN ('DRAFT', 'BOOKED', 'PICKED_UP', 'DELIVERED')
+        status IN (
+    'DRAFT',
+    'BOOKED',
+    'PICKED_UP',
+    'DELIVERED',
+    'CANCELLED'
+)
     ),
     booked_at                   TIMESTAMPTZ,
     pickup_window_start         TIMESTAMPTZ,

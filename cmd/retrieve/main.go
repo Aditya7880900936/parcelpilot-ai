@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Aditya7880900936/parcelpilot-ai/internal/action"
 	"github.com/Aditya7880900936/parcelpilot-ai/internal/agent"
 	"github.com/Aditya7880900936/parcelpilot-ai/internal/db"
 	"github.com/Aditya7880900936/parcelpilot-ai/internal/embeddings"
@@ -40,13 +41,11 @@ func main() {
 		log.Fatalf("database ping failed: %v", err)
 	}
 
-	// Embedding provider.
 	provider := embeddings.NewOllamaProvider(
 		getEnv("OLLAMA_BASE_URL", "http://localhost:11434"),
 		getEnv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
 	)
 
-	// Retrieval layer.
 	retriever := retrieval.NewPostgresRetriever(pool)
 
 	retrievalService := retrieval.NewService(
@@ -56,11 +55,9 @@ func main() {
 
 	agentRetriever := agent.NewRetrieverAdapter(retrievalService)
 
-	// Structured data layer.
 	accountRepository := db.NewAccountContextRepository(pool)
 	contextLoader := db.NewContextLoader(accountRepository)
 
-	// Agent layer.
 	decisionEngine := agent.NewDecisionEngine()
 	contextBuilder := agent.NewContextBuilder()
 
@@ -70,6 +67,9 @@ func main() {
 		decisionEngine,
 		contextBuilder,
 	)
+
+	// Action execution layer.
+	executor := action.NewExecutor(pool)
 
 	query := "Can Northstar cancel ORD-1001?"
 
@@ -98,6 +98,19 @@ func main() {
 			response.Action.Target,
 			response.Action.Reason,
 		)
+
+		// Execute only deterministic, approved actions.
+		if response.Action.Type == "CANCEL_ORDER" && !response.Escalate {
+			if err := executor.Execute(ctx, response.Action); err != nil {
+				log.Fatalf("action execution failed: %v", err)
+			}
+
+			log.Printf(
+				"Action executed successfully: %s → %s",
+				response.Action.Type,
+				response.Action.Target,
+			)
+		}
 	}
 
 	log.Println("\n========== SOURCES ==========")

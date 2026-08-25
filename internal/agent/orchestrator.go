@@ -75,10 +75,11 @@ func (o *Orchestrator) Evaluate(
 	decision := o.decisionEngine.Evaluate(agentContext)
 
 	return &Response{
-		Answer:   decision.Reason,
-		Sources:  chunks,
-		Action:   decision.Action,
-		Escalate: decision.Escalate,
-		Reason:   decision.Reason,
+		Answer:     decision.Reason,
+		Confidence: decision.Confidence,
+		Sources:    chunks,
+		Action:     decision.Action,
+		Escalate:   decision.Escalate,
+		Reason:     decision.Reason,
 	}, nil
 }
