@@ -2,10 +2,12 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Aditya7880900936/parcelpilot-ai/internal/agent"
 	"github.com/Aditya7880900936/parcelpilot-ai/internal/db"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -104,6 +106,7 @@ func (e *Executor) cancelOrder(
 				"status": "CANCELLED",
 			},
 		)
+
 		if err != nil {
 			return fmt.Errorf("audit cancellation: %w", err)
 		}
@@ -151,11 +154,11 @@ func (e *Executor) returnToOrigin(
 	)
 
 	err = tx.QueryRow(ctx, `
-        SELECT status, account_id
-        FROM orders
-        WHERE order_id = $1
-        FOR UPDATE
-    `, act.Target).Scan(&status, &accountID)
+		SELECT status, account_id
+		FROM orders
+		WHERE order_id = $1
+		FOR UPDATE
+	`, act.Target).Scan(&status, &accountID)
 
 	if err != nil {
 		return fmt.Errorf("load order %s: %w", act.Target, err)
@@ -164,12 +167,12 @@ func (e *Executor) returnToOrigin(
 	switch status {
 	case "PICKED_UP":
 		_, err = tx.Exec(ctx, `
-            UPDATE orders
-            SET
-                status = 'RETURN_TO_ORIGIN',
-                updated_at = NOW()
-            WHERE order_id = $1
-        `, act.Target)
+			UPDATE orders
+			SET
+				status = 'RETURN_TO_ORIGIN',
+				updated_at = NOW()
+			WHERE order_id = $1
+		`, act.Target)
 
 		if err != nil {
 			return fmt.Errorf(
@@ -194,6 +197,7 @@ func (e *Executor) returnToOrigin(
 				"status": "RETURN_TO_ORIGIN",
 			},
 		)
+
 		if err != nil {
 			return fmt.Errorf("audit return-to-origin: %w", err)
 		}
@@ -220,6 +224,10 @@ func (e *Executor) escalate(
 	ctx context.Context,
 	act *agent.Action,
 ) error {
+	if act == nil {
+		return fmt.Errorf("action is nil")
+	}
+
 	if act.Target == "" {
 		return fmt.Errorf("ticket ID is required for escalation")
 	}
@@ -233,31 +241,62 @@ func (e *Executor) escalate(
 	var accountID string
 
 	err = tx.QueryRow(ctx, `
-        SELECT account_id
-        FROM tickets
-        WHERE ticket_id = $1
-    `, act.Target).Scan(&accountID)
+		SELECT account_id
+		FROM tickets
+		WHERE ticket_id = $1
+	`, act.Target).Scan(&accountID)
 
 	if err != nil {
 		return fmt.Errorf("load ticket %s: %w", act.Target, err)
 	}
 
+	// Check whether this ticket already has an active escalation.
+	var existingID int64
+
+	err = tx.QueryRow(ctx, `
+		SELECT id
+		FROM escalations
+		WHERE ticket_id = $1
+		  AND status = 'created'
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, act.Target).Scan(&existingID)
+
+	if err == nil {
+		// Already escalated; keep the operation idempotent.
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing escalation: %w", err)
+		}
+
+		return nil
+	}
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check existing escalation: %w", err)
+	}
+
+	// Create a new P1 escalation.
 	_, err = tx.Exec(ctx, `
-        INSERT INTO escalations (
-            ticket_id,
-            account_id,
-            reason,
-            priority,
-            status,
-            requested_by
-        )
-        VALUES ($1, $2, $3, 'P1', 'created', 'agent')
-    `,
+		INSERT INTO escalations (
+			ticket_id,
+			account_id,
+			reason,
+			priority,
+			status,
+			requested_by
+		)
+		VALUES ($1, $2, $3, 'P1', 'created', 'agent')
+	`,
 		act.Target,
 		accountID,
 		act.Reason,
 	)
 
+	if err != nil {
+		return fmt.Errorf("create escalation: %w", err)
+	}
+
+	// Record the state-changing action in the same transaction.
 	auditRepo := db.NewAuditLogRepository(tx)
 
 	err = auditRepo.Create(
@@ -273,12 +312,9 @@ func (e *Executor) escalate(
 			"requested_by": "agent",
 		},
 	)
-	if err != nil {
-		return fmt.Errorf("audit escalation: %w", err)
-	}
 
 	if err != nil {
-		return fmt.Errorf("create escalation: %w", err)
+		return fmt.Errorf("audit escalation: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
