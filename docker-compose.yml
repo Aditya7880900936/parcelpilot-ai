@@ -14,6 +14,12 @@ services:
       timeout: 5s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: parcelpilot-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+
   server:
     build:
       context: .
@@ -21,7 +27,7 @@ services:
     container_name: parcelpilot-server
     environment:
       DATABASE_URL: postgres://parcelpilot:parcelpilot@postgres:5432/parcelpilot
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_EMBEDDING_MODEL: nomic-embed-text
       SERVER_ADDR: :8080
     ports:
@@ -29,8 +35,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      ollama:
+        condition: service_started
 
 volumes:
   postgres_data:
+  ollama_data:
