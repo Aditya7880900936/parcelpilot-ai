@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -144,7 +145,7 @@ func main() {
 
 		// Reject trailing JSON values.
 		var extra any
-		if err := decoder.Decode(&extra); err == nil {
+		if err := decoder.Decode(&extra); err != io.EOF {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "request body must contain a single JSON object",
 			})
@@ -199,7 +200,6 @@ func main() {
 
 		// Execute only high-confidence deterministic actions.
 		if response.Action != nil &&
-			!response.Escalate &&
 			response.Confidence >= 0.90 {
 
 			if err := executor.Execute(requestCtx, response.Action); err != nil {

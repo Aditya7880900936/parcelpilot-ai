@@ -1,4 +1,7 @@
+// internal/domain/context.go
 package domain
+
+import "time"
 
 type AccountContext struct {
 	AccountID      string
@@ -9,13 +12,14 @@ type AccountContext struct {
 }
 
 type OrderContext struct {
-	OrderID       string
-	AccountID     string
-	Status        string
-	Carrier       string
-	ShipmentFee   float64
-	CarrierFault  bool
-	CustomerFault bool
+	OrderID         string
+	AccountID       string
+	Status          string
+	Carrier         string
+	ShipmentFee     float64
+	CarrierFault    bool
+	CustomerFault   bool
+	PickupWindowEnd *time.Time
 }
 
 type TicketContext struct {

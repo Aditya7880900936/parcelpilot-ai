@@ -1,8 +1,10 @@
+// internal/agent/decision.go
 package agent
 
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Decision struct {
@@ -29,7 +31,6 @@ func (d *DecisionEngine) Evaluate(ctx Context) Decision {
 		}
 	}
 
-	// Security incidents / suspected credential exposure are P1.
 	for _, ticket := range ctx.Tickets {
 		if strings.EqualFold(ticket.Subject, "Possible API key exposure") {
 			return Decision{
@@ -49,7 +50,7 @@ func (d *DecisionEngine) Evaluate(ctx Context) Decision {
 		return Decision{
 			NeedsAgent: true,
 			Confidence: 0,
-			Reason:     "order context is required for cancellation evaluation",
+			Reason:     "order context is required",
 		}
 	}
 
@@ -89,15 +90,150 @@ func (d *DecisionEngine) Evaluate(ctx Context) Decision {
 
 	case "BOOKED":
 		return d.evaluateBookedCancellation(ctx)
+
+	default:
+		return Decision{
+			NeedsAgent: true,
+			Confidence: 0,
+			Reason: fmt.Sprintf(
+				"no deterministic rule for order status %s",
+				ctx.Order.Status,
+			),
+		}
+	}
+}
+
+func (d *DecisionEngine) EvaluateServiceCredit(
+	ctx Context,
+	now time.Time,
+) Decision {
+	if ctx.Account == nil {
+		return Decision{
+			NeedsAgent: true,
+			Confidence: 0,
+			Reason:     "account context is required",
+		}
+	}
+
+	if ctx.Order == nil {
+		return Decision{
+			NeedsAgent: true,
+			Confidence: 0,
+			Reason:     "order context is required for service-credit evaluation",
+		}
+	}
+
+	order := ctx.Order
+
+	if order.PickupWindowEnd == nil {
+		return Decision{
+			NeedsAgent: true,
+			Confidence: 1.0,
+			Reason:     "pickup window end is unknown; service-credit eligibility cannot be verified",
+		}
+	}
+
+	if now.Before(order.PickupWindowEnd.Add(2 * time.Hour)) {
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason:     "pickup is not more than 2 hours past the scheduled pickup window",
+		}
+	}
+
+	if !order.CarrierFault {
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason:     "carrier fault is not confirmed",
+		}
+	}
+
+	if order.CustomerFault {
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason:     "customer-caused issue makes the order ineligible for a service credit",
+		}
+	}
+
+	credit := order.ShipmentFee * 0.10
+
+	if credit > 500 {
+		credit = 500
+	}
+
+	threshold := 2 * time.Hour
+	agreementCredit := false
+
+	accountName := strings.ToLower(ctx.Account.AccountName)
+
+	for _, chunk := range ctx.Chunks {
+		content := normalizeText(chunk.Content)
+
+		if !strings.Contains(content, accountName) {
+			continue
+		}
+
+		if strings.Contains(content, "fixed inr 300 service credit") &&
+			strings.Contains(content, "more than 4 hours past the end") &&
+			strings.Contains(content, "carrier is at fault") {
+
+			threshold = 4 * time.Hour
+			credit = 300
+			agreementCredit = true
+		}
+	}
+
+	if now.Before(order.PickupWindowEnd.Add(threshold)) {
+		return Decision{
+			Allowed:    false,
+			Confidence: 1.0,
+			Reason: fmt.Sprintf(
+				"pickup is not more than %s past the scheduled pickup window",
+				threshold,
+			),
+		}
+	}
+
+	if credit > 1000 {
+		return Decision{
+			NeedsAgent: true,
+			Confidence: 1.0,
+			Reason: fmt.Sprintf(
+				"service credit of INR %.2f requires manager approval",
+				credit,
+			),
+			Action: &Action{
+				Type:   "SERVICE_CREDIT_APPROVAL",
+				Target: order.OrderID,
+				Reason: fmt.Sprintf("manager approval required for INR %.2f service credit", credit),
+			},
+		}
+	}
+
+	reason := fmt.Sprintf(
+		"order %s qualifies for INR %.2f service credit",
+		order.OrderID,
+		credit,
+	)
+
+	if agreementCredit {
+		reason = fmt.Sprintf(
+			"%s under the active customer agreement",
+			reason,
+		)
 	}
 
 	return Decision{
-		NeedsAgent: true,
-		Confidence: 0,
-		Reason: fmt.Sprintf(
-			"no deterministic rule for order status %s",
-			ctx.Order.Status,
-		),
+		Allowed:    true,
+		Confidence: 1.0,
+		Reason:     reason,
+		Action: &Action{
+			Type:   "SERVICE_CREDIT",
+			Target: order.OrderID,
+			Reason: reason,
+		},
 	}
 }
 
@@ -120,40 +256,33 @@ func (d *DecisionEngine) evaluateBookedCancellation(ctx Context) Decision {
 			bestScore = chunk.Score
 		}
 
-		// Customer-specific agreement allowing cancellation.
 		if strings.Contains(content, accountName) &&
 			strings.Contains(content, "may cancel any booked shipment") &&
 			strings.Contains(content, "before pickup") &&
 			strings.Contains(content, "no cancellation fee") {
-
 			hasAgreement = true
 			agreementCount++
 		}
 
-		// Customer-specific agreement explicitly denying cancellation.
 		if strings.Contains(content, accountName) &&
 			(strings.Contains(content, "cannot cancel") ||
 				strings.Contains(content, "may not cancel") ||
 				strings.Contains(content, "cancellation is not permitted")) {
-
 			hasDenyAgreement = true
 			denyAgreementCount++
 		}
 
-		// Current default cancellation policy.
 		if strings.Contains(content, "booked, not yet picked_up") &&
 			strings.Contains(content, "may be cancelled") {
-
 			hasPolicy = true
 		}
 	}
 
-	// Conflicting customer-specific evidence is never auto-actioned.
 	if hasAgreement && hasDenyAgreement {
 		return Decision{
 			NeedsAgent: true,
 			Escalate:   true,
-			Confidence: 0.0,
+			Confidence: 0,
 			Reason: fmt.Sprintf(
 				"conflicting customer agreements found for %s; cancellation of order %s requires verification",
 				ctx.Account.AccountName,
@@ -162,13 +291,11 @@ func (d *DecisionEngine) evaluateBookedCancellation(ctx Context) Decision {
 		}
 	}
 
-	// Multiple contradictory agreement signals should also be treated
-	// conservatively rather than executing a state-changing action.
 	if agreementCount > 1 && denyAgreementCount > 0 {
 		return Decision{
 			NeedsAgent: true,
 			Escalate:   true,
-			Confidence: 0.0,
+			Confidence: 0,
 			Reason: fmt.Sprintf(
 				"conflicting cancellation evidence found for %s; state-changing action requires verification",
 				ctx.Account.AccountName,
@@ -176,7 +303,6 @@ func (d *DecisionEngine) evaluateBookedCancellation(ctx Context) Decision {
 		}
 	}
 
-	// Strong customer agreement evidence.
 	if hasAgreement && bestScore >= 0.60 {
 		return Decision{
 			Allowed:    true,
@@ -194,7 +320,6 @@ func (d *DecisionEngine) evaluateBookedCancellation(ctx Context) Decision {
 		}
 	}
 
-	// Agreement exists, but retrieval confidence is insufficient.
 	if hasAgreement {
 		return Decision{
 			NeedsAgent: true,
@@ -206,7 +331,6 @@ func (d *DecisionEngine) evaluateBookedCancellation(ctx Context) Decision {
 		}
 	}
 
-	// Only default policy was found.
 	if hasPolicy {
 		return Decision{
 			NeedsAgent: true,

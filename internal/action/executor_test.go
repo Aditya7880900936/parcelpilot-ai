@@ -534,3 +534,110 @@ func TestExecutorEscalateCreatesAuditLog(t *testing.T) {
 		t.Fatalf("unexpected new state: %s", newState)
 	}
 }
+
+func TestExecutorServiceCreditCreatesCredit(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	// Clean previous test credit.
+	_, err := pool.Exec(ctx, `
+		DELETE FROM service_credits
+		WHERE order_id = 'TEST-CREDIT'
+	`)
+	if err != nil {
+		t.Fatalf("failed to clean service credit: %v", err)
+	}
+
+	// Ensure test order exists.
+	_, err = pool.Exec(ctx, `
+INSERT INTO orders (
+    order_id,
+    account_id,
+    status,
+    carrier,
+    shipment_fee_inr,
+    created_at,
+    updated_at
+)
+VALUES (
+    'TEST-CREDIT',
+    'TEST-001',
+    'BOOKED',
+    'TEST-CARRIER',
+    1200,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (order_id) DO UPDATE
+SET
+    account_id = EXCLUDED.account_id,
+    status = 'BOOKED',
+    carrier = EXCLUDED.carrier,
+    shipment_fee_inr = EXCLUDED.shipment_fee_inr,
+    updated_at = NOW()
+`)
+	if err != nil {
+		t.Fatalf("failed to prepare test order: %v", err)
+	}
+
+	executor := NewExecutor(pool)
+
+	err = executor.Execute(ctx, &agent.Action{
+		Type:   "SERVICE_CREDIT",
+		Target: "TEST-CREDIT",
+		Reason: "carrier delayed pickup",
+	})
+	if err != nil {
+		t.Fatalf("expected service credit to succeed: %v", err)
+	}
+
+	var (
+		accountID   string
+		amount      float64
+		reason      string
+		status      string
+		requestedBy string
+	)
+
+	err = pool.QueryRow(ctx, `
+		SELECT
+			account_id,
+			amount_inr,
+			reason,
+			status,
+			requested_by
+		FROM service_credits
+		WHERE order_id = 'TEST-CREDIT'
+		LIMIT 1
+	`).Scan(
+		&accountID,
+		&amount,
+		&reason,
+		&status,
+		&requestedBy,
+	)
+
+	if err != nil {
+		t.Fatalf("failed to read service credit: %v", err)
+	}
+
+	if accountID != "TEST-001" {
+		t.Fatalf("expected account TEST-001, got %s", accountID)
+	}
+
+	if amount <= 0 {
+		t.Fatalf("expected positive credit amount, got %.2f", amount)
+	}
+
+	if reason != "carrier delayed pickup" {
+		t.Fatalf("unexpected reason: %s", reason)
+	}
+
+	if status != "ISSUED" {
+		t.Fatalf("expected ISSUED, got %s", status)
+	}
+
+	if requestedBy != "agent" {
+		t.Fatalf("expected agent, got %s", requestedBy)
+	}
+}

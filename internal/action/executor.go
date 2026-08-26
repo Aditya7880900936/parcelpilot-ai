@@ -37,6 +37,12 @@ func (e *Executor) Execute(
 	case "ESCALATE":
 		return e.escalate(ctx, act)
 
+	case "SERVICE_CREDIT":
+		return e.issueServiceCredit(ctx, act)
+
+	case "SERVICE_CREDIT_APPROVAL":
+		return e.requestServiceCreditApproval(ctx, act)
+
 	default:
 		return fmt.Errorf("unsupported action type: %s", act.Type)
 	}
@@ -250,7 +256,7 @@ func (e *Executor) escalate(
 		return fmt.Errorf("load ticket %s: %w", act.Target, err)
 	}
 
-	// Check whether this ticket already has an active escalation.
+	// Idempotency: do not create another active escalation.
 	var existingID int64
 
 	err = tx.QueryRow(ctx, `
@@ -263,7 +269,6 @@ func (e *Executor) escalate(
 	`, act.Target).Scan(&existingID)
 
 	if err == nil {
-		// Already escalated; keep the operation idempotent.
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit existing escalation: %w", err)
 		}
@@ -275,7 +280,7 @@ func (e *Executor) escalate(
 		return fmt.Errorf("check existing escalation: %w", err)
 	}
 
-	// Create a new P1 escalation.
+	// Create escalation.
 	_, err = tx.Exec(ctx, `
 		INSERT INTO escalations (
 			ticket_id,
@@ -296,7 +301,7 @@ func (e *Executor) escalate(
 		return fmt.Errorf("create escalation: %w", err)
 	}
 
-	// Record the state-changing action in the same transaction.
+	// Create audit log in the SAME transaction.
 	auditRepo := db.NewAuditLogRepository(tx)
 
 	err = auditRepo.Create(
@@ -319,6 +324,296 @@ func (e *Executor) escalate(
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit escalation: %w", err)
+	}
+
+	return nil
+}
+
+func (e *Executor) issueServiceCredit(
+	ctx context.Context,
+	act *agent.Action,
+) error {
+	if act == nil {
+		return fmt.Errorf("action is nil")
+	}
+
+	if act.Target == "" {
+		return fmt.Errorf("order ID is required for service credit")
+	}
+
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin service credit transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var (
+		accountID   string
+		shipmentFee float64
+		orderStatus string
+	)
+
+	err = tx.QueryRow(ctx, `
+		SELECT account_id, shipment_fee_inr, status
+		FROM orders
+		WHERE order_id = $1
+		FOR UPDATE
+	`, act.Target).Scan(
+		&accountID,
+		&shipmentFee,
+		&orderStatus,
+	)
+
+	if err != nil {
+		return fmt.Errorf("load order %s for service credit: %w", act.Target, err)
+	}
+
+	if orderStatus != "BOOKED" {
+		return fmt.Errorf(
+			"cannot issue service credit for order %s in status %s",
+			act.Target,
+			orderStatus,
+		)
+	}
+
+	// Idempotency: an active credit already exists.
+	var existingStatus string
+
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM service_credits
+		WHERE order_id = $1
+		  AND status IN ('PENDING_APPROVAL', 'APPROVED', 'ISSUED')
+		LIMIT 1
+	`, act.Target).Scan(&existingStatus)
+
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing service credit: %w", err)
+		}
+
+		return nil
+	}
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check existing service credit: %w", err)
+	}
+
+	credit := shipmentFee * 0.10
+
+	if credit > 500 {
+		credit = 500
+	}
+
+	if credit <= 0 {
+		return fmt.Errorf(
+			"invalid service credit amount for order %s",
+			act.Target,
+		)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO service_credits (
+			order_id,
+			account_id,
+			amount_inr,
+			reason,
+			status,
+			requested_by,
+			issued_at
+		)
+		VALUES (
+			$1,
+			$2,
+			$3,
+			$4,
+			'ISSUED',
+			'agent',
+			NOW()
+		)
+	`,
+		act.Target,
+		accountID,
+		credit,
+		act.Reason,
+	)
+
+	if err != nil {
+		return fmt.Errorf("issue service credit: %w", err)
+	}
+
+	auditRepo := db.NewAuditLogRepository(tx)
+
+	err = auditRepo.Create(
+		ctx,
+		accountID,
+		act.Type,
+		act.Target,
+		act.Reason,
+		map[string]any{},
+		map[string]any{
+			"amount_inr":   credit,
+			"status":       "ISSUED",
+			"requested_by": "agent",
+		},
+	)
+
+	if err != nil {
+		return fmt.Errorf("audit service credit: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit service credit: %w", err)
+	}
+
+	return nil
+}
+
+func (e *Executor) requestServiceCreditApproval(
+	ctx context.Context,
+	act *agent.Action,
+) error {
+	if act == nil {
+		return fmt.Errorf("action is nil")
+	}
+
+	if act.Target == "" {
+		return fmt.Errorf("order ID is required for service credit approval")
+	}
+
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"begin service credit approval transaction: %w",
+			err,
+		)
+	}
+	defer tx.Rollback(ctx)
+
+	var (
+		accountID   string
+		shipmentFee float64
+		orderStatus string
+	)
+
+	err = tx.QueryRow(ctx, `
+		SELECT account_id, shipment_fee_inr, status
+		FROM orders
+		WHERE order_id = $1
+		FOR UPDATE
+	`, act.Target).Scan(
+		&accountID,
+		&shipmentFee,
+		&orderStatus,
+	)
+
+	if err != nil {
+		return fmt.Errorf("load order %s for credit approval: %w", act.Target, err)
+	}
+
+	if orderStatus != "BOOKED" {
+		return fmt.Errorf(
+			"cannot request service credit approval for order %s in status %s",
+			act.Target,
+			orderStatus,
+		)
+	}
+
+	// Idempotency: do not create another active credit request.
+	var existingStatus string
+
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM service_credits
+		WHERE order_id = $1
+		  AND status IN ('PENDING_APPROVAL', 'APPROVED', 'ISSUED')
+		LIMIT 1
+	`, act.Target).Scan(&existingStatus)
+
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf(
+				"commit existing service credit approval: %w",
+				err,
+			)
+		}
+
+		return nil
+	}
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf(
+			"check existing service credit approval: %w",
+			err,
+		)
+	}
+
+	credit := shipmentFee * 0.10
+
+	if credit > 500 {
+		credit = 500
+	}
+
+	if credit <= 0 {
+		return fmt.Errorf(
+			"invalid service credit amount for order %s",
+			act.Target,
+		)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO service_credits (
+			order_id,
+			account_id,
+			amount_inr,
+			reason,
+			status,
+			requested_by
+		)
+		VALUES (
+			$1,
+			$2,
+			$3,
+			$4,
+			'PENDING_APPROVAL',
+			'agent'
+		)
+	`,
+		act.Target,
+		accountID,
+		credit,
+		act.Reason,
+	)
+
+	if err != nil {
+		return fmt.Errorf("create service credit approval: %w", err)
+	}
+
+	auditRepo := db.NewAuditLogRepository(tx)
+
+	err = auditRepo.Create(
+		ctx,
+		accountID,
+		act.Type,
+		act.Target,
+		act.Reason,
+		map[string]any{},
+		map[string]any{
+			"amount_inr":   credit,
+			"status":       "PENDING_APPROVAL",
+			"requested_by": "agent",
+		},
+	)
+
+	if err != nil {
+		return fmt.Errorf("audit service credit approval: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf(
+			"commit service credit approval: %w",
+			err,
+		)
 	}
 
 	return nil

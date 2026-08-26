@@ -1,3 +1,4 @@
+// internal/db/account_context.go
 package db
 
 import (
@@ -60,7 +61,8 @@ func (r *AccountContextRepository) GetOrder(
 			carrier,
 			shipment_fee_inr,
 			carrier_fault,
-			customer_fault
+			customer_fault,
+			pickup_window_end
 		FROM orders
 		WHERE order_id = $1
 	`, orderID).Scan(
@@ -71,6 +73,7 @@ func (r *AccountContextRepository) GetOrder(
 		&order.ShipmentFee,
 		&order.CarrierFault,
 		&order.CustomerFault,
+		&order.PickupWindowEnd,
 	)
 
 	if err != nil {
